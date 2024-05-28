@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description:  This template is for the bcda-v2 data to healthlake
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Parameters:
+
+  KMSKeyId:
+    Type: String
+    Default: kms-key-id
+    Description: id of kms key used to create healthlake datastore
+
+  HealthLakeDataStoreId:
+    Type: String
+    Default: datastore-id
+    Description: id of healthlake datastore
+
+  BCDAV2DataS3BucketName:
+    Type: String
+    Default: bucket-name
+    Description: S3 bucket where the BCDA v2 data that was fetched will be stored
+
+  HealthLakeImportJobOutputS3BucketName:
+    Type: String
+    Default: bucket-name
+    Description: S3 bucket where the output of the fhir import jobs will be stored
+
+  CredentialsSecretName:
+    Type: String
+    Default: credentials-secret-name
+    Description: Name of secret where the client id and client secret are stored
+
+  NotificationEmail:
+    Type: String
+    Default: email@example.com
+    Description: Email to recieve import job notifications
+
+
+Resources:
+  
+
+  BCDAV2DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BCDAV2DataS3BucketName
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  HealthLakeImportJobOutputS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref HealthLakeImportJobOutputS3BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  FetchDataLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/bcda
+      Handler: fetchData.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt FetchDataLambdaExecutionRole.Arn
+      ReservedConcurrentExecutions: 10
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          EXPORT_BUCKET: !Ref BCDAV2DataS3BucketName
+          SECRET_NAME: !Ref CredentialsSecretName
+          REGION: !Ref AWS::Region      
+          
+  FetchDataLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FetchDataLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns: []
+      Policies:
+        - PolicyName: fetch-data-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${CredentialsSecretName}
+                  - !Sub arn:aws:s3:::${BCDAV2DataS3BucketName}/*
+  CheckImportJobsLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/bcda
+      Handler: checkImportJob.lambda_handler
+      Runtime: python3.11
+      ReservedConcurrentExecutions: 10
+      MemorySize: 512
+      Timeout: 300
+      Policies: 
+        - AmazonHealthLakeFullAccess
+        - AWSLakeFormationDataAdmin
+        - AmazonS3FullAccess
+      Environment:
+        Variables:
+          DATASTORE_ID: !Ref HealthLakeDataStoreId
+          
+  ImportToHealthLakeLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/bcda
+      Handler: importtoHealthlake.lambda_handler
+      Runtime: python3.11
+      ReservedConcurrentExecutions: 3
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt HealthLakeLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref HealthLakeImportJobOutputS3BucketName
+          DATA_ACCESS_ROLE: !GetAtt HealthLakeLambdaExecutionRole.Arn
+          DATASTORE_ID: !Ref HealthLakeDataStoreId
+          REGION: !Ref AWS::Region
+          ACCOUNT_ID: !Ref AWS::AccountId
+          KMS_KEY: !Ref KMSKeyId
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref BCDAV2DataBucket
+            Events:
+              - s3:ObjectCreated:*
+              - s3:ObjectRemoved:*   
+              
+  HealthLakeLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HealthLakeLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: healthlake.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonHealthLakeFullAccess
+        - arn:aws:iam::aws:policy/AWSLakeFormationDataAdmin
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: healthlake-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - healthlake:ListFHIRExportJobs
+                  - healthlake:ListFHIRImportJobs
+                  - healthlake:DescribeFHIRExportJob
+                  - healthlake:DescribeFHIRImportJob
+                  - healthlake:StartFHIRExportJob
+                  - healthlake:StartFHIRImportJob
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+
+                Resource:
+                  - !Sub arn:aws:s3:::${HealthLakeImportJobOutputS3BucketName}
+                  - !Sub arn:aws:s3:::${HealthLakeImportJobOutputS3BucketName}/*
+                  - !Sub arn:aws:s3:::${BCDAV2DataS3BucketName}
+                  - !Sub arn:aws:s3:::${BCDAV2DataS3BucketName}/*
+                  - !Sub arn:aws:healthlake:*:*:datastore/fhir/*
+                  - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}
+  
+  ImportJobNotifications:
+    Type: AWS::SNS::Topic
+    Properties:
+         TopicName: ImportJobNotifications1
+
+  ImportJobNotificationsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref ImportJobNotifications
+      Endpoint: !Ref NotificationEmail
+      
+  BCDAToHealthLakeStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: stateMachine.asl.json
+      DefinitionSubstitutions:
+        FetchDataLambdaArn: !GetAtt FetchD  ataLambda.Arn
+        CheckImportJobsLambdaArn: !GetAtt CheckImportJobsLambda.Arn
+        ImportJobNotificationsArn: !Ref ImportJobNotifications
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchDataLambda
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckImportJobsLambda
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref ImportJobNotifications
+        - AmazonSNSFullAccess
+        - CloudWatchLogsFullAccess
+      Type: STANDARD
+  
+ 
+  
+Outputs:
+  CDAStepFunctionARN:
+    Description: "BCDA Step function ARN "
+    Value: !Sub "${BCDAToHealthLakeStateMachine}"
